@@ -1,0 +1,504 @@
+import React, { useEffect, useMemo, useState } from "react";
+
+/**
+ * Round Counter – tabs & predefined prices
+ * Single-file React component. Uses Tailwind for styling (no external UI libs).
+ * Features
+ * - Predefined item buttons with prices (editable)
+ * - Add/remove people
+ * - Start a Round: pick buyer, tap item buttons per person, then "Commit Round"
+ * - Tabs accrue to the people who consumed the items; we also track who bought the round
+ * - History with undo
+ * - LocalStorage persistence
+ * - CSV export
+ */
+
+// --- utilities --------------------------------------------------------------
+const fmt = (n) => new Intl.NumberFormat(undefined, { style: "currency", currency: guessCurrency() }).format(n);
+
+function guessCurrency() {
+  // Simple heuristic based on browser locale; fallback EUR.
+  try {
+    const loc = (navigator.language || "en-GB").toLowerCase();
+    if (loc.includes("en-us")) return "USD";
+    if (loc.includes("en-gb") || loc.includes("nl") || loc.includes("de") || loc.includes("fr")) return "EUR";
+    if (loc.includes("en-au")) return "AUD";
+    if (loc.includes("en-ca")) return "CAD";
+  } catch {}
+  return "EUR";
+}
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+// --- main component ---------------------------------------------------------
+export default function RoundCounterApp() {
+  const [people, setPeople] = useState(() => loadLS("rc_people", [
+    { id: uid(), name: "Alex", tab: 0, roundsBought: 0 },
+    { id: uid(), name: "Sam", tab: 0, roundsBought: 0 },
+  ]));
+
+  const [items, setItems] = useState(() => loadLS("rc_items", [
+    { id: uid(), name: "Beer", price: 5.0 },
+    { id: uid(), name: "Wine", price: 6.5 },
+    { id: uid(), name: "Soda", price: 3.0 },
+    { id: uid(), name: "Cocktail", price: 9.0 },
+  ]));
+
+  const [buyerId, setBuyerId] = useState(() => loadLS("rc_buyer", null));
+  const [pending, setPending] = useState(() => loadLS("rc_pending", {})); // { personId: { itemId: qty } }
+  const [history, setHistory] = useState(() => loadLS("rc_history", []));
+  const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => saveLS("rc_people", people), [people]);
+  useEffect(() => saveLS("rc_items", items), [items]);
+  useEffect(() => saveLS("rc_buyer", buyerId), [buyerId]);
+  useEffect(() => saveLS("rc_pending", pending), [pending]);
+  useEffect(() => saveLS("rc_history", history), [history]);
+
+  const buyer = people.find((p) => p.id === buyerId) || null;
+
+  const pendingTotalsByPerson = useMemo(() => {
+    const map = {};
+    for (const pid of Object.keys(pending)) {
+      let total = 0;
+      for (const iid of Object.keys(pending[pid])) {
+        const it = items.find((i) => i.id === iid);
+        if (it) total += it.price * (pending[pid][iid] || 0);
+      }
+      map[pid] = total;
+    }
+    return map;
+  }, [pending, items]);
+
+  const roundGrandTotal = useMemo(
+    () => Object.values(pendingTotalsByPerson).reduce((a, b) => a + b, 0),
+    [pendingTotalsByPerson]
+  );
+
+  // --- actions --------------------------------------------------------------
+  function addPerson(name) {
+    name = name?.trim();
+    if (!name) return;
+    setPeople((ps) => [...ps, { id: uid(), name, tab: 0, roundsBought: 0 }]);
+  }
+
+  function removePerson(id) {
+    setPeople((ps) => ps.filter((p) => p.id !== id));
+    setPending((pd) => {
+      const c = { ...pd };
+      delete c[id];
+      return c;
+    });
+    if (buyerId === id) setBuyerId(null);
+  }
+
+  function addItem(name, price) {
+    name = name?.trim();
+    const p = Number(price);
+    if (!name || !isFinite(p) || p < 0) return;
+    setItems((its) => [...its, { id: uid(), name, price: +p.toFixed(2) }]);
+  }
+
+  function updateItem(id, patch) {
+    setItems((its) => its.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+  }
+
+  function removeItem(id) {
+    setItems((its) => its.filter((i) => i.id !== id));
+    setPending((pd) => {
+      const cp = structuredClone(pd);
+      for (const pid of Object.keys(cp)) delete cp[pid][id];
+      return cp;
+    });
+  }
+
+  function incPending(personId, itemId, delta = 1) {
+    setPending((pd) => {
+      const cp = structuredClone(pd);
+      cp[personId] = cp[personId] || {};
+      cp[personId][itemId] = Math.max(0, (cp[personId][itemId] || 0) + delta);
+      if (cp[personId][itemId] === 0) delete cp[personId][itemId];
+      if (Object.keys(cp[personId]).length === 0) delete cp[personId];
+      return cp;
+    });
+  }
+
+  function clearPending() {
+    setPending({});
+  }
+
+  function commitRound() {
+    if (!buyerId) {
+      alert("Pick the buyer for this round.");
+      return;
+    }
+    if (Object.keys(pending).length === 0) {
+      alert("No items selected for anyone.");
+      return;
+    }
+
+    // Add costs to each consumer's tab
+    setPeople((ps) =>
+      ps.map((p) => {
+        const add = pendingTotalsByPerson[p.id] || 0;
+        if (add === 0) return p;
+        return { ...p, tab: +(p.tab + add).toFixed(2) };
+      })
+    );
+
+    // increment round count for buyer
+    setPeople((ps) => ps.map((p) => (p.id === buyerId ? { ...p, roundsBought: (p.roundsBought || 0) + 1 } : p)));
+
+    const entry = {
+      id: uid(),
+      at: new Date().toISOString(),
+      buyerId,
+      lines: JSON.parse(JSON.stringify(pending)), // {personId:{itemId:qty}}
+    };
+    setHistory((h) => [entry, ...h].slice(0, 200));
+    setPending({});
+  }
+
+  function undoLast() {
+    const [last, ...rest] = history;
+    if (!last) return;
+
+    // subtract tabs
+    const deltaByPerson = {};
+    for (const pid of Object.keys(last.lines)) {
+      let t = 0;
+      for (const iid of Object.keys(last.lines[pid])) {
+        const it = items.find((i) => i.id === iid);
+        if (it) t += it.price * last.lines[pid][iid];
+      }
+      deltaByPerson[pid] = t;
+    }
+
+    setPeople((ps) =>
+      ps.map((p) => {
+        const sub = deltaByPerson[p.id] || 0;
+        if (!sub) return p;
+        return { ...p, tab: +(p.tab - sub).toFixed(2) };
+      })
+    );
+
+    // decrement buyer's roundsBought
+    setPeople((ps) => ps.map((p) => (p.id === last.buyerId ? { ...p, roundsBought: Math.max(0, (p.roundsBought || 0) - 1) } : p)));
+
+    setHistory(rest);
+  }
+
+  function resetAll() {
+    if (!confirm("Reset tabs, history and pending?")) return;
+    setPeople((ps) => ps.map((p) => ({ ...p, tab: 0, roundsBought: 0 })));
+    setPending({});
+    setHistory([]);
+  }
+
+  function settlePerson(id) {
+    setPeople((ps) => ps.map((p) => (p.id === id ? { ...p, tab: 0 } : p)));
+  }
+
+  function exportCSV() {
+    const rows = [];
+    rows.push(["timestamp", "buyer", "person", "item", "qty", "price", "line_total"]);
+
+    for (const entry of [...history].reverse()) {
+      const buyer = people.find((p) => p.id === entry.buyerId)?.name || "?";
+      for (const pid of Object.keys(entry.lines)) {
+        const person = people.find((p) => p.id === pid)?.name || "(removed)";
+        for (const iid of Object.keys(entry.lines[pid])) {
+          const it = items.find((i) => i.id === iid);
+          if (!it) continue;
+          const qty = entry.lines[pid][iid];
+          const lt = +(qty * it.price).toFixed(2);
+          rows.push([entry.at, buyer, person, it.name, qty, it.price, lt]);
+        }
+      }
+    }
+
+    const csv = rows.map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rounds_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // --- render helpers -------------------------------------------------------
+  const PersonCard = ({ person }) => (
+    <div className="rounded-2xl border p-4 bg-white/60 shadow-sm flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <div className="font-medium text-lg">{person.name}</div>
+        <button
+          className="text-xs px-2 py-1 rounded bg-red-50 hover:bg-red-100 border border-red-200"
+          onClick={() => removePerson(person.id)}
+          title="Remove person"
+        >✕</button>
+      </div>
+
+      <div className="text-sm text-gray-600">Tab: <span className="font-semibold text-gray-900">{fmt(person.tab)}</span></div>
+      <div className="text-xs text-gray-500">Rounds bought: {person.roundsBought || 0}</div>
+
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+        {items.map((it) => (
+          <div key={it.id} className="flex items-center gap-2">
+            <button
+              className="w-full rounded-xl border px-3 py-2 hover:bg-gray-50"
+              onClick={() => incPending(person.id, it.id, +1)}
+              title={`Add ${it.name} to ${person.name}`}
+            >+ {it.name} ({fmt(it.price)})</button>
+            {(pending[person.id]?.[it.id] || 0) > 0 && (
+              <button
+                className="rounded-lg border px-2 py-2 hover:bg-gray-50"
+                onClick={() => incPending(person.id, it.id, -1)}
+                title="Remove one"
+              >−</button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {pendingTotalsByPerson[person.id] > 0 && (
+        <div className="text-right text-sm text-gray-700">
+          Pending: <span className="font-semibold">{fmt(pendingTotalsByPerson[person.id])}</span>
+        </div>
+      )}
+
+      {person.tab > 0 && (
+        <button
+          className="self-end text-xs mt-1 px-3 py-1 rounded-full border hover:bg-gray-50"
+          onClick={() => settlePerson(person.id)}
+        >Settle tab</button>
+      )}
+    </div>
+  );
+
+  // --- UI -------------------------------------------------------------------
+  return (
+    <div className="min-h-screen w-full bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900 p-4 md:p-8">
+      <div className="max-w-6xl mx-auto flex flex-col gap-6">
+        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Round Counter</h1>
+          <div className="flex items-center gap-2">
+            <button className="px-3 py-2 rounded-xl border hover:bg-gray-50" onClick={() => setShowSettings((s) => !s)}>
+              {showSettings ? "Close settings" : "Items & settings"}
+            </button>
+            <button className="px-3 py-2 rounded-xl border hover:bg-gray-50" onClick={exportCSV}>Export CSV</button>
+            <button className="px-3 py-2 rounded-xl border hover:bg-gray-50" onClick={undoLast} disabled={!history.length}>
+              Undo last
+            </button>
+            <button className="px-3 py-2 rounded-xl border hover:bg-red-100 bg-red-50 border-red-200" onClick={resetAll}>
+              Reset all
+            </button>
+          </div>
+        </header>
+
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* People column */}
+          <div className="lg:col-span-1 flex flex-col gap-4">
+            <div className="rounded-2xl border bg-white/70 p-4 shadow-sm">
+              <div className="font-semibold mb-2">People</div>
+              <AddPerson onAdd={addPerson} />
+              <div className="grid gap-3 mt-3">
+                {people.map((p) => (
+                  <PersonCard key={p.id} person={p} />
+                ))}
+                {people.length === 0 && (
+                  <div className="text-sm text-gray-500">Add someone to get started.</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Round builder */}
+          <div className="lg:col-span-2 flex flex-col gap-4">
+            <div className="rounded-2xl border bg-white/80 p-4 shadow-sm">
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                <div className="font-semibold">Build a round</div>
+                <div className="flex items-center gap-2">
+                  <label className="text-sm text-gray-600">Buyer</label>
+                  <select
+                    className="border rounded-xl px-3 py-2 bg-white"
+                    value={buyerId || ""}
+                    onChange={(e) => setBuyerId(e.target.value || null)}
+                  >
+                    <option value="">— Select —</option>
+                    {people.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                  {buyer && <span className="text-xs text-gray-500">({buyer.name}) will be marked as buyer; costs still go to each person's tab</span>}
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                {people.length === 0 ? (
+                  <div className="text-sm text-gray-500">Add people first.</div>
+                ) : (
+                  people.map((p) => (
+                    <div key={p.id} className="rounded-xl border p-3 bg-white">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="font-medium">{p.name}</div>
+                        {pendingTotalsByPerson[p.id] > 0 && (
+                          <div className="text-sm text-gray-700">Pending: <strong>{fmt(pendingTotalsByPerson[p.id])}</strong></div>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                        {items.map((it) => (
+                          <div key={it.id} className="flex items-center gap-2">
+                            <button className="w-full rounded-xl border px-3 py-2 hover:bg-gray-50" onClick={() => incPending(p.id, it.id, +1)}>
+                              + {it.name} ({fmt(it.price)})
+                            </button>
+                            {(pending[p.id]?.[it.id] || 0) > 0 && (
+                              <button className="rounded-lg border px-2 py-2 hover:bg-gray-50" onClick={() => incPending(p.id, it.id, -1)}>−</button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="flex items-center justify-between mt-4">
+                <div className="text-sm text-gray-600">Round total: <span className="font-semibold text-gray-900">{fmt(roundGrandTotal)}</span></div>
+                <div className="flex items-center gap-2">
+                  <button className="px-3 py-2 rounded-xl border hover:bg-gray-50" onClick={clearPending}>Clear pending</button>
+                  <button className="px-3 py-2 rounded-xl border bg-black text-white hover:opacity-90" onClick={commitRound}>Commit round</button>
+                </div>
+              </div>
+            </div>
+
+            {/* History */}
+            <div className="rounded-2xl border bg-white/80 p-4 shadow-sm">
+              <div className="font-semibold mb-2">History</div>
+              {history.length === 0 ? (
+                <div className="text-sm text-gray-500">No rounds yet.</div>
+              ) : (
+                <div className="grid gap-3">
+                  {history.map((h) => (
+                    <div key={h.id} className="rounded-xl border p-3">
+                      <div className="flex items-center justify-between">
+                        <div className="text-sm text-gray-600">
+                          <span className="font-medium">{new Date(h.at).toLocaleString()}</span> — buyer: <span className="font-medium">{people.find((p) => p.id === h.buyerId)?.name || "?"}</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-sm grid gap-1">
+                        {Object.keys(h.lines).map((pid) => (
+                          <div key={pid}>
+                            <span className="font-medium">{people.find((p) => p.id === pid)?.name || "(removed)"}:</span>{" "}
+                            {Object.keys(h.lines[pid])
+                              .map((iid) => {
+                                const it = items.find((i) => i.id === iid);
+                                if (!it) return null;
+                                const q = h.lines[pid][iid];
+                                return `${q}× ${it.name}`;
+                              })
+                              .filter(Boolean)
+                              .join(", ")}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {showSettings && (
+          <section className="rounded-2xl border bg-white p-4 shadow-sm">
+            <div className="font-semibold mb-3">Items & prices</div>
+            <div className="grid gap-2 mb-4">
+              {items.map((it) => (
+                <div key={it.id} className="grid grid-cols-12 gap-2 items-center">
+                  <input
+                    className="col-span-6 md:col-span-5 border rounded-xl px-3 py-2"
+                    value={it.name}
+                    onChange={(e) => updateItem(it.id, { name: e.target.value })}
+                  />
+                  <input
+                    className="col-span-4 md:col-span-3 border rounded-xl px-3 py-2"
+                    type="number"
+                    step="0.01"
+                    value={it.price}
+                    onChange={(e) => updateItem(it.id, { price: +(+e.target.value || 0).toFixed(2) })}
+                  />
+                  <div className="col-span-2 md:col-span-2 text-sm text-gray-600">{fmt(it.price)}</div>
+                  <button className="col-span-12 md:col-span-2 px-3 py-2 rounded-xl border hover:bg-gray-50" onClick={() => removeItem(it.id)}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+            <AddItem onAdd={addItem} />
+          </section>
+        )}
+
+        <footer className="text-center text-xs text-gray-500 py-6">Tabs accrue to each person who had a drink. Buyer is tracked for fairness, not for charging.</footer>
+      </div>
+    </div>
+  );
+}
+
+function AddPerson({ onAdd }) {
+  const [name, setName] = useState("");
+  return (
+    <form
+      className="flex gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onAdd(name);
+        setName("");
+      }}
+    >
+      <input
+        className="flex-1 border rounded-xl px-3 py-2"
+        placeholder="Add a name…"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+      />
+      <button className="px-3 py-2 rounded-xl border hover:bg-gray-50" type="submit">Add</button>
+    </form>
+  );
+}
+
+function AddItem({ onAdd }) {
+  const [name, setName] = useState("");
+  const [price, setPrice] = useState("");
+  return (
+    <form
+      className="grid grid-cols-1 md:grid-cols-5 gap-2"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onAdd(name, price);
+        setName("");
+        setPrice("");
+      }}
+    >
+      <input className="md:col-span-3 border rounded-xl px-3 py-2" placeholder="Item name (e.g., Beer)" value={name} onChange={(e) => setName(e.target.value)} />
+      <input className="md:col-span-1 border rounded-xl px-3 py-2" placeholder="Price" type="number" step="0.01" value={price} onChange={(e) => setPrice(e.target.value)} />
+      <button className="md:col-span-1 px-3 py-2 rounded-xl border hover:bg-gray-50" type="submit">Add item</button>
+    </form>
+  );
+}
+
+// --- localStorage helpers ---------------------------------------------------
+function loadLS(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+function saveLS(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+}
